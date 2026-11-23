@@ -278,3 +278,46 @@ test("authorized user can clear persisted and current-session memory", async () 
     else process.env.UPSTASH_REDIS_REST_TOKEN = previousRedisToken;
   }
 });
+
+test("Gemini AbortError uses the timeout fallback instead of the generic error", async () => {
+  const handler = (await import("../api/index.js")).default;
+  const previousApiKey = process.env.GEMINI_API_KEY;
+  const previousModel = process.env.GEMINI_MODEL;
+  const previousRedisUrl = process.env.UPSTASH_REDIS_REST_URL;
+  const previousRedisToken = process.env.UPSTASH_REDIS_REST_TOKEN;
+  const previousSerperKey = process.env.SERPER_API_KEY;
+  const previousFetch = globalThis.fetch;
+
+  process.env.GEMINI_API_KEY = "test-key";
+  delete process.env.GEMINI_MODEL;
+  delete process.env.UPSTASH_REDIS_REST_URL;
+  delete process.env.UPSTASH_REDIS_REST_TOKEN;
+  delete process.env.SERPER_API_KEY;
+  globalThis.fetch = async () => {
+    throw new DOMException("This operation was aborted", "AbortError");
+  };
+
+  let payload;
+  const res = {
+    status() { return this; },
+    json(value) { payload = value; return value; },
+    setHeader() {}
+  };
+
+  try {
+    await handler({ method: "POST", body: { request: { command: "Расскажи интересный факт" } } }, res);
+    assert.equal(payload.response.text, "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.");
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousApiKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = previousApiKey;
+    if (previousModel === undefined) delete process.env.GEMINI_MODEL;
+    else process.env.GEMINI_MODEL = previousModel;
+    if (previousRedisUrl === undefined) delete process.env.UPSTASH_REDIS_REST_URL;
+    else process.env.UPSTASH_REDIS_REST_URL = previousRedisUrl;
+    if (previousRedisToken === undefined) delete process.env.UPSTASH_REDIS_REST_TOKEN;
+    else process.env.UPSTASH_REDIS_REST_TOKEN = previousRedisToken;
+    if (previousSerperKey === undefined) delete process.env.SERPER_API_KEY;
+    else process.env.SERPER_API_KEY = previousSerperKey;
+  }
+});

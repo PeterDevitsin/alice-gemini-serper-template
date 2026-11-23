@@ -11,9 +11,9 @@ const MAX_CONTEXT_MESSAGES = 8;
 const MAX_CONTEXT_MESSAGE_CHARS = 700;
 const MEMORY_STORE_TIMEOUT_MS = 350;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 4200;
+const TOTAL_RESPONSE_BUDGET_MS = 4400;
 const SERPER_TIMEOUT_MS = 600;
-const GEMINI_TIMEOUT_MS = 3200;
+const GEMINI_TIMEOUT_MS = 3500;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -516,7 +516,11 @@ export default async function handler(req, res) {
 
     return res.status(200).json(aliceResponse(answer, false, history, userStateUpdate(body, history)));
   } catch (error) {
-    const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
+    const errorMessage = typeof error === "string" ? error : error?.message;
+    const isAbortError = error?.name === "AbortError" || /\babort(?:ed)?\b/i.test(errorMessage || "");
+    const safeError = isAbortError
+      ? new Error("TIME_BUDGET_EXHAUSTED")
+      : error;
     console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
     return res.status(200).json(aliceResponse(
       errorForUser(safeError),
