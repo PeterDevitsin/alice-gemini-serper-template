@@ -18,7 +18,7 @@ const GEMINI_TIMEOUT_MS = 3500;
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
   "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
-  "Обычно отвечай в 2–5 коротких предложениях: сначала дай суть, затем добавь важные пояснения или шаги, если они нужны. На простой вопрос отвечай короче. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
+  "Обычно отвечай в 2–5 коротких предложениях, не более 750 символов: сначала дай суть, затем добавь только важные пояснения или шаги. На простой вопрос отвечай короче. Заканчивай полное предложение. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
   "Учитывай сохранённый контекст предыдущих разговоров, если он относится к вопросу.",
   "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
   "Если не знаешь ответа, честно скажи об этом."
@@ -38,6 +38,15 @@ function aliceResponse(text, endSession = false, history = [], userStateUpdate) 
   return result;
 }
 
+function lastCompleteSentence(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return "";
+
+  const matches = [...text.matchAll(/[.!?…](?=\s|$)/g)];
+  const lastMatch = matches.at(-1);
+  return lastMatch ? text.slice(0, lastMatch.index + 1).trim() : "";
+}
+
 function fitAliceText(value) {
   const text = String(value ?? "")
     .replace(/[\r\n\t]+/g, " ")
@@ -47,15 +56,7 @@ function fitAliceText(value) {
   if (text.length <= MAX_ALICE_TEXT) return text || "Не удалось подготовить ответ.";
 
   const candidate = text.slice(0, MAX_ALICE_TEXT - 1);
-  const sentenceEnd = Math.max(
-    candidate.lastIndexOf(". "),
-    candidate.lastIndexOf("! "),
-    candidate.lastIndexOf("? ")
-  );
-  if (sentenceEnd >= 300) return candidate.slice(0, sentenceEnd + 1).trim();
-
-  const lastSpace = candidate.lastIndexOf(" ");
-  return (lastSpace > 200 ? candidate.slice(0, lastSpace) : candidate).trim() + "…";
+  return lastCompleteSentence(candidate) || "Ответ не поместился целиком. Спросите о самом важном.";
 }
 
 function isSearchIntent(text) {
@@ -385,6 +386,9 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   }
   if (candidate?.finishReason === "MAX_TOKENS") {
     console.warn("Gemini reached the output token limit.");
+    const completeAnswer = lastCompleteSentence(answer);
+    if (!completeAnswer) throw new Error("GEMINI_INCOMPLETE_RESPONSE");
+    return completeAnswer;
   }
   return answer;
 }
@@ -399,6 +403,8 @@ function errorForUser(error) {
       return "Сейчас превышен лимит запросов к Gemini. Попробуйте немного позже.";
     case "GEMINI_BLOCKED":
       return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
+    case "GEMINI_INCOMPLETE_RESPONSE":
+      return "Ответ не поместился целиком. Спросите о самом важном.";
     case "TIME_BUDGET_EXHAUSTED":
     case "AbortError":
       return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
@@ -428,6 +434,7 @@ export default async function handler(req, res) {
   let oldHistory = historyFromState(body);
   let persistentMemory = null;
   const memoryUserId = persistentUserId(body);
+  let memoryLoadPromise = Promise.resolve(null);
 
   if (isForgetMemoryRequest(text)) {
     let memoryDeleted = true;
@@ -464,23 +471,23 @@ export default async function handler(req, res) {
   }
 
   if (memoryUserId && hasPersistentMemoryConfig()) {
-    try {
-      const loadTimeout = Math.min(MEMORY_STORE_TIMEOUT_MS, Math.max(100, remainingMs() - 3500));
-      persistentMemory = await loadPersistentMemory(memoryUserId, loadTimeout);
-      oldHistory = persistentMemory.messages.length
-        ? selectRelevantHistory(persistentMemory.messages, text)
-        : historyFromState(body);
-    } catch {
-      persistentMemory = null;
+    const loadTimeout = Math.min(MEMORY_STORE_TIMEOUT_MS, Math.max(100, remainingMs() - 3500));
+    memoryLoadPromise = loadPersistentMemory(memoryUserId, loadTimeout).catch(() => {
       console.warn("Persistent memory could not be read; using the short Yandex state instead.");
-    }
+      return null;
+    });
   }
 
   try {
-    let searchContext = "";
-    if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      // Search has a very short budget because Alice expects a response within 4.5 seconds.
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
+    const searchPromise = isSearchIntent(text) && process.env.SERPER_API_KEY
+      ? searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)))
+      : Promise.resolve("");
+    const [loadedMemory, searchContext] = await Promise.all([memoryLoadPromise, searchPromise]);
+    if (loadedMemory) {
+      persistentMemory = loadedMemory;
+      oldHistory = loadedMemory.messages.length
+        ? selectRelevantHistory(loadedMemory.messages, text)
+        : historyFromState(body);
     }
 
     const answer = await askGemini(

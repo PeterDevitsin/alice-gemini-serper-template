@@ -28,6 +28,7 @@ test("long responses are cut at a natural boundary and stay within Alice limit",
   const value = fitAliceText(("Это короткое предложение. ").repeat(100));
   assert.ok(value.length <= 1024);
   assert.ok(value.endsWith("."));
+  assert.equal(fitAliceText("Незавершённая фраза ".repeat(100)), "Ответ не поместился целиком. Спросите о самом важном.");
 });
 
 test("history filters malformed messages and keeps last 8", () => {
@@ -193,6 +194,7 @@ test("Yandex session user memory is sent to Gemini and saved across sessions", a
       role: "user",
       parts: [{ text: "Меня зовут Анна" }]
     });
+    assert.match(geminiBody.systemInstruction.parts[0].text, /750 символов/);
     assert.deepEqual(geminiBody.generationConfig, {
       temperature: 0.5,
       maxOutputTokens: 512,
@@ -308,6 +310,141 @@ test("Gemini AbortError uses the timeout fallback instead of the generic error",
     await handler({ method: "POST", body: { request: { command: "Расскажи интересный факт" } } }, res);
     assert.equal(payload.response.text, "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.");
   } finally {
+    globalThis.fetch = previousFetch;
+    if (previousApiKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = previousApiKey;
+    if (previousModel === undefined) delete process.env.GEMINI_MODEL;
+    else process.env.GEMINI_MODEL = previousModel;
+    if (previousRedisUrl === undefined) delete process.env.UPSTASH_REDIS_REST_URL;
+    else process.env.UPSTASH_REDIS_REST_URL = previousRedisUrl;
+    if (previousRedisToken === undefined) delete process.env.UPSTASH_REDIS_REST_TOKEN;
+    else process.env.UPSTASH_REDIS_REST_TOKEN = previousRedisToken;
+    if (previousSerperKey === undefined) delete process.env.SERPER_API_KEY;
+    else process.env.SERPER_API_KEY = previousSerperKey;
+  }
+});
+
+test("Gemini MAX_TOKENS returns only complete sentences", async () => {
+  const handler = (await import("../api/index.js")).default;
+  const previousApiKey = process.env.GEMINI_API_KEY;
+  const previousModel = process.env.GEMINI_MODEL;
+  const previousRedisUrl = process.env.UPSTASH_REDIS_REST_URL;
+  const previousRedisToken = process.env.UPSTASH_REDIS_REST_TOKEN;
+  const previousSerperKey = process.env.SERPER_API_KEY;
+  const previousFetch = globalThis.fetch;
+  process.env.GEMINI_API_KEY = "test-key";
+  delete process.env.GEMINI_MODEL;
+  delete process.env.UPSTASH_REDIS_REST_URL;
+  delete process.env.UPSTASH_REDIS_REST_TOKEN;
+  delete process.env.SERPER_API_KEY;
+
+  let generatedText = "Первое предложение завершено. Второе предложение тоже завершено. Обрывок не должен прозвучать";
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    async json() {
+      return { candidates: [{ finishReason: "MAX_TOKENS", content: { parts: [{ text: generatedText }] } }] };
+    }
+  });
+
+  const askAlice = async () => {
+    let payload;
+    const res = {
+      status() { return this; },
+      json(value) { payload = value; return value; },
+      setHeader() {}
+    };
+    await handler({ method: "POST", body: { request: { command: "Объясни коротко" } } }, res);
+    return payload;
+  };
+
+  try {
+    assert.equal((await askAlice()).response.text, "Первое предложение завершено. Второе предложение тоже завершено.");
+    generatedText = "Единственный ответ оборвался до точки";
+    assert.equal((await askAlice()).response.text, "Ответ не поместился целиком. Спросите о самом важном.");
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousApiKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = previousApiKey;
+    if (previousModel === undefined) delete process.env.GEMINI_MODEL;
+    else process.env.GEMINI_MODEL = previousModel;
+    if (previousRedisUrl === undefined) delete process.env.UPSTASH_REDIS_REST_URL;
+    else process.env.UPSTASH_REDIS_REST_URL = previousRedisUrl;
+    if (previousRedisToken === undefined) delete process.env.UPSTASH_REDIS_REST_TOKEN;
+    else process.env.UPSTASH_REDIS_REST_TOKEN = previousRedisToken;
+    if (previousSerperKey === undefined) delete process.env.SERPER_API_KEY;
+    else process.env.SERPER_API_KEY = previousSerperKey;
+  }
+});
+
+test("persistent memory retrieval overlaps with web search", async () => {
+  const handler = (await import("../api/index.js")).default;
+  const previousApiKey = process.env.GEMINI_API_KEY;
+  const previousModel = process.env.GEMINI_MODEL;
+  const previousRedisUrl = process.env.UPSTASH_REDIS_REST_URL;
+  const previousRedisToken = process.env.UPSTASH_REDIS_REST_TOKEN;
+  const previousSerperKey = process.env.SERPER_API_KEY;
+  const previousFetch = globalThis.fetch;
+  process.env.GEMINI_API_KEY = "test-key";
+  delete process.env.GEMINI_MODEL;
+  process.env.UPSTASH_REDIS_REST_URL = "https://redis.test";
+  process.env.UPSTASH_REDIS_REST_TOKEN = "redis-test-token";
+  process.env.SERPER_API_KEY = "search-test-key";
+
+  let redisReadResolved = false;
+  let searchStartedBeforeRedisReadResolved = false;
+  let resolveRedisRead;
+  const redisReadGate = new Promise(resolve => { resolveRedisRead = resolve; });
+  const releaseRedisRead = response => {
+    if (redisReadResolved) return;
+    redisReadResolved = true;
+    resolveRedisRead(response);
+  };
+  const redisReadResponse = {
+    ok: true,
+    status: 200,
+    async json() { return { result: JSON.stringify({ messages: [] }) }; }
+  };
+  const releaseTimer = setTimeout(() => releaseRedisRead(redisReadResponse), 250);
+
+  globalThis.fetch = async (url, options) => {
+    if (url === "https://redis.test") {
+      const command = JSON.parse(options.body);
+      if (command[0] === "GET") return redisReadGate;
+      return { ok: true, status: 200, async json() { return { result: "OK" }; } };
+    }
+    if (url === "https://google.serper.dev/search") {
+      searchStartedBeforeRedisReadResolved = !redisReadResolved;
+      releaseRedisRead(redisReadResponse);
+      return {
+        ok: true,
+        status: 200,
+        async json() { return { organic: [{ title: "Погода", snippet: "Солнечно", link: "https://example.test" }] }; }
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      async json() { return { candidates: [{ content: { parts: [{ text: "Сегодня солнечно." }] } }] }; }
+    };
+  };
+
+  let payload;
+  const res = {
+    status() { return this; },
+    json(value) { payload = value; return value; },
+    setHeader() {}
+  };
+
+  try {
+    await handler({
+      method: "POST",
+      body: { request: { command: "Какая погода сегодня?" }, session: { user_id: "yandex-user-1" } }
+    }, res);
+    assert.equal(searchStartedBeforeRedisReadResolved, true);
+    assert.equal(payload.response.text, "Сегодня солнечно.");
+  } finally {
+    clearTimeout(releaseTimer);
     globalThis.fetch = previousFetch;
     if (previousApiKey === undefined) delete process.env.GEMINI_API_KEY;
     else process.env.GEMINI_API_KEY = previousApiKey;
